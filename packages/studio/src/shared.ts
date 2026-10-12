@@ -105,6 +105,8 @@ export type StudioItem = {
   readonly temporal?: StudioTemporalLineage;
   /** Rendering identities implementing this author Item; optional for non-visual Items. */
   readonly renderIds: readonly string[];
+  /** Opaque manifest identity for a locally resolved media binding; never exposes a path or locator. */
+  readonly mediaAsset?: { readonly assetId: string; readonly sha256: string };
   /** Companion-selected writable fields; hidden source bindings never cross into this surface. */
   readonly inspector: readonly StudioInspectorField[];
   readonly editHandles: readonly StudioEditHandle[];
@@ -277,6 +279,12 @@ export type StudioMutation =
         | { readonly kind: "track-object"; readonly trackId: string; readonly objectId: string };
       readonly parameterId: string;
       readonly value: CanonicalValue;
+    }
+  | {
+      readonly type: "media.replace";
+      readonly revision: number;
+      readonly itemId: string;
+      readonly assetId: string;
     };
 
 export type StudioFailure = {

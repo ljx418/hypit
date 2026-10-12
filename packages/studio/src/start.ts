@@ -10,6 +10,7 @@ Open a Run in the browser to inspect its composition, Sources and Results.
 
   hypit studio --run <build.svrun> [--runtime <hypit.runtime.json>]
     [--port <number>] [--project <directory>] [--package-root <directory>]
+    [--asset-manifest <narralens.assets.json>]
     [--locale-pack <./language.json | installed-package/language.json>]...
 
   hypit studio --check-locale <./language.json | installed-package/language.json>
@@ -33,7 +34,7 @@ function invalidArguments(message: string): never {
 }
 
 function argumentsByName(argv: readonly string[]): ReadonlyMap<string, readonly string[]> {
-  const accepted = new Set(["run", "runtime", "port", "project", "package-root", "locale-pack", "check-locale"]);
+  const accepted = new Set(["run", "runtime", "port", "project", "package-root", "locale-pack", "check-locale", "asset-manifest"]);
   const result = new Map<string, string[]>();
   for (let index = 0; index < argv.length; index += 2) {
     const flag = argv[index];
@@ -108,6 +109,9 @@ export async function runStudio(
   if (!Number.isSafeInteger(port) || port <= 0) invalidArguments("--port must be a positive integer");
 
   const distributionPackageRoot = application.distribution.packageRoot ?? resolve(here, "../..");
+  const assetManifestArgument = values.get("asset-manifest")?.at(-1);
+  const assetManifest = assetManifestArgument === undefined ? undefined
+    : await (await import("./asset-manifest.js")).loadStudioAssetManifest(resolve(invokedFrom, assetManifestArgument), workspaceRoot);
   const domain = await loadStudioDomain({ run: runPath, workspaceRoot, packageRoot, distribution: application.distribution });
   const registry = await loadStudioCompanionRegistry({
     distributionPackageRoot,
@@ -163,6 +167,7 @@ export async function runStudio(
       workspaceRoot,
       domain,
       registry,
+      ...(assetManifest === undefined ? {} : { assetManifest }),
       ...(buildLibrary === undefined ? {} : { buildLibrary }),
     })],
   });
