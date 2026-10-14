@@ -285,6 +285,7 @@ export type StudioMutation =
       readonly revision: number;
       readonly itemId: string;
       readonly assetId: string;
+      readonly manifestSha256: string;
     };
 
 export type StudioFailure = {

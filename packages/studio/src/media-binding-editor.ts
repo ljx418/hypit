@@ -7,7 +7,7 @@ import {
   type StructuredElement,
 } from "@hypit/hypit/markup";
 
-import type { StudioAsset, StudioAssetManifest } from "./asset-manifest.js";
+import type { StudioAsset, StudioAssetManifestView } from "./asset-manifest.js";
 import type { Range, StudioSnapshot } from "./shared.js";
 
 export type SourcePatch = {
@@ -150,7 +150,7 @@ async function existingBinding(
   current: Binding,
   sourcePath: string,
   asset: StudioAsset,
-  manifest: StudioAssetManifest,
+  manifest: StudioAssetManifestView,
 ): Promise<Binding | undefined> {
   for (const normalize of parsed.elements.filter((element) => element.name === "mediaop:Normalize")) {
     if (comparableNormalize(normalize) !== comparableNormalize(current.normalize)) continue;
@@ -171,7 +171,7 @@ async function cleanupGenerated(
   current: Binding,
   authoredId: string,
   sourcePath: string,
-  manifest: StudioAssetManifest,
+  manifest: StudioAssetManifestView,
 ): Promise<SourcePatch | undefined> {
   const currentAsset = await manifest.identifyLocator(sourcePath, current.locator);
   if (currentAsset === undefined) return undefined;
@@ -193,7 +193,7 @@ export async function planMediaReplacement(input: {
   readonly sourceText: string;
   readonly authoredId: string;
   readonly asset: StudioAsset;
-  readonly manifest: StudioAssetManifest;
+  readonly manifest: StudioAssetManifestView;
 }): Promise<readonly SourcePatch[]> {
   const parsed = parseSource(input.sourcePath, input.sourceText);
   const current = bindingFor(parsed, input.authoredId);
@@ -239,7 +239,7 @@ export async function planMediaReplacement(input: {
 export async function projectMediaAssets(
   snapshot: StudioSnapshot,
   sourcePath: string,
-  manifest: StudioAssetManifest,
+  manifest: StudioAssetManifestView,
 ): Promise<StudioSnapshot> {
   const parsed = parseSource(sourcePath, snapshot.source.text);
   const tracks = await Promise.all(snapshot.tracks.map(async (track) => ({

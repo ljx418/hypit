@@ -9,7 +9,7 @@ import type { BuildResultFileRange } from "@hypit/hypit/result";
 import type { StudioTemporalInstantProjection } from "@hypit/studio-companion";
 
 import type { StudioBuildLibrary } from "./build-library.js";
-import type { StudioAssetManifest } from "./asset-manifest.js";
+import type { StudioAssetManifest, StudioAssetManifestLease } from "./asset-manifest.js";
 import { StudioAssetManifestChanged, StudioAssetRejected } from "./asset-manifest.js";
 import type { ServedFile } from "./compile.js";
 import type { StudioDomain } from "./domain.js";
@@ -85,6 +85,34 @@ function conflict(error: unknown): boolean {
 
 class StudioMutationRejected extends Error {}
 
+export function validMediaReplaceRequest(value: {
+  readonly itemId?: unknown;
+  readonly assetId?: unknown;
+  readonly manifestSha256?: unknown;
+}): boolean {
+  return typeof value.itemId === "string" && typeof value.assetId === "string"
+    && typeof value.manifestSha256 === "string" && /^[a-f0-9]{64}$/u.test(value.manifestSha256);
+}
+
+export async function commitManifestLeasedSourceMutation<TPrevious, TResult>(options: {
+  readonly lease?: Pick<StudioAssetManifestLease, "assertCurrent">;
+  readonly apply: () => Promise<TPrevious>;
+  readonly publishAndValidate: () => Promise<TResult>;
+  readonly restoreAndPublish: (previous: TPrevious) => Promise<void>;
+}): Promise<TResult> {
+  await options.lease?.assertCurrent();
+  const previous = await options.apply();
+  try {
+    await options.lease?.assertCurrent();
+    const result = await options.publishAndValidate();
+    await options.lease?.assertCurrent();
+    return result;
+  } catch (error) {
+    await options.restoreAndPublish(previous);
+    throw error;
+  }
+}
+
 export function studioPlugin(options: StudioPluginOptions): Plugin {
   let snapshot: StudioSnapshot | undefined;
   let visualHtml: string | undefined;
@@ -154,7 +182,7 @@ export function studioPlugin(options: StudioPluginOptions): Plugin {
       revision = attempt;
       snapshot = options.assetManifest === undefined
         ? result.snapshot
-        : await projectMediaAssets(result.snapshot, run.authorSource, options.assetManifest);
+        : await projectMediaAssets(result.snapshot, run.authorSource, await options.assetManifest.current());
       visualHtml = result.visualHtml;
       visualDocument = result.document;
       material = result.material;
@@ -382,17 +410,17 @@ export function studioPlugin(options: StudioPluginOptions): Plugin {
     return patches.filter((patch) => patch.replacement !== patch.preimage);
   };
 
-  const mutationPatches = async (mutation: StudioMutation): Promise<readonly Patch[]> => {
+  const mutationPatches = async (mutation: StudioMutation, manifestLease?: StudioAssetManifestLease): Promise<readonly Patch[]> => {
     if (mutation.type === "timeline.adjust") return timelinePatches(mutation);
     if (mutation.type === "media.replace") {
       try {
-        if (options.assetManifest === undefined) throw new StudioAssetRejected("Studio has no registered asset manifest.");
+        if (manifestLease === undefined) throw new StudioAssetRejected("Studio has no registered asset manifest lease.");
         const item = currentItem(mutation.itemId);
         if (item.presentId === undefined) throw new StudioAssetRejected(`Item ${mutation.itemId} is not a visual item.`);
-        const asset = await options.assetManifest.resolve(mutation.assetId);
+        const asset = await manifestLease.resolve(mutation.assetId);
         const sourceText = await readFile(currentSource, "utf8");
         const planned = await planMediaReplacement({ sourcePath: currentSource, sourceText,
-          authoredId: item.authoredId, asset, manifest: options.assetManifest });
+          authoredId: item.authoredId, asset, manifest: manifestLease });
         return planned.map((item) => ({ ...item, path: relative(options.workspaceRoot, currentSource) }));
       } catch (error) {
         if (error instanceof StudioAssetManifestChanged) throw error;
@@ -445,55 +473,69 @@ export function studioPlugin(options: StudioPluginOptions): Plugin {
     mutating = true;
     try {
       const beforeSnapshot = snapshot;
-      const patches = await mutationPatches(mutation);
-      if (patches.length === 0) return snapshot.revision;
-      const previous = await applyTransaction(patches, mutation.revision);
-      const attempt = ++requestedRevision;
-      await publish(attempt, false);
-      const temporalMismatch = mutation.type !== "timeline.adjust" || failure?.revision === attempt
-        ? undefined
-        : (() => {
-            const item = snapshot?.tracks.flatMap((track) => track.items)
-              .find((candidate) => candidate.id === mutation.itemId);
-            if (item === undefined) return `Item ${mutation.itemId} disappeared after recompilation.`;
-            return mutation.target.kind === "instant"
-              ? item.startFrame === mutation.target.frame ? undefined
-                : `Item ${mutation.itemId} resolved to frame ${item.startFrame}, not ${mutation.target.frame}.`
-              : item.startFrame === mutation.target.startFrame
-                  && item.endFrameExclusive === mutation.target.endFrameExclusive ? undefined
-                : `Item ${mutation.itemId} resolved to [${item.startFrame}, ${item.endFrameExclusive}), not [${mutation.target.startFrame}, ${mutation.target.endFrameExclusive}).`;
-          })();
-      const mediaMismatch = mutation.type !== "media.replace" || failure?.revision === attempt
-        ? undefined
-        : (() => {
-            const afterSnapshot = snapshot;
-            if (beforeSnapshot === undefined || afterSnapshot === undefined) return "Studio lost the media mutation snapshot.";
-            const beforeItems = beforeSnapshot.tracks.flatMap((track) => track.items);
-            const afterItems = afterSnapshot.tracks.flatMap((track) => track.items);
-            const target = afterItems.find((item) => item.id === mutation.itemId);
-            if (target?.mediaAsset?.assetId !== mutation.assetId) return `Item ${mutation.itemId} did not resolve to asset ${mutation.assetId}.`;
-            if (beforeItems.length !== afterItems.length
-              || JSON.stringify(beforeSnapshot.timeline) !== JSON.stringify(afterSnapshot.timeline)
-              || JSON.stringify(beforeSnapshot.run) !== JSON.stringify(afterSnapshot.run)) return "Media replacement changed the Run or timeline.";
-            for (const before of beforeItems) {
-              const after = afterItems.find((item) => item.id === before.id);
-              if (after === undefined || before.startFrame !== after.startFrame || before.endFrameExclusive !== after.endFrameExclusive
-                || before.authoredId !== after.authoredId) return `Media replacement changed item ${before.id}.`;
-              if (before.id !== mutation.itemId && JSON.stringify(before.mediaAsset) !== JSON.stringify(after.mediaAsset)) {
-                return `Media replacement changed non-target item ${before.id}.`;
+      let manifestLease: StudioAssetManifestLease | undefined;
+      if (mutation.type === "media.replace") {
+        if (options.assetManifest === undefined) throw new StudioMutationRejected("Studio has no registered asset manifest.");
+        manifestLease = await options.assetManifest.lease(mutation.manifestSha256);
+      }
+      const patches = await mutationPatches(mutation, manifestLease);
+      if (patches.length === 0) {
+        await manifestLease?.assertCurrent();
+        return snapshot.revision;
+      }
+      return await commitManifestLeasedSourceMutation({
+        ...(manifestLease === undefined ? {} : { lease: manifestLease }),
+        apply: async () => await applyTransaction(patches, mutation.revision),
+        publishAndValidate: async () => {
+        const attempt = ++requestedRevision;
+        await publish(attempt, false);
+        const temporalMismatch = mutation.type !== "timeline.adjust" || failure?.revision === attempt
+          ? undefined
+          : (() => {
+              const item = snapshot?.tracks.flatMap((track) => track.items)
+                .find((candidate) => candidate.id === mutation.itemId);
+              if (item === undefined) return `Item ${mutation.itemId} disappeared after recompilation.`;
+              return mutation.target.kind === "instant"
+                ? item.startFrame === mutation.target.frame ? undefined
+                  : `Item ${mutation.itemId} resolved to frame ${item.startFrame}, not ${mutation.target.frame}.`
+                : item.startFrame === mutation.target.startFrame
+                    && item.endFrameExclusive === mutation.target.endFrameExclusive ? undefined
+                  : `Item ${mutation.itemId} resolved to [${item.startFrame}, ${item.endFrameExclusive}), not [${mutation.target.startFrame}, ${mutation.target.endFrameExclusive}).`;
+            })();
+        const mediaMismatch = mutation.type !== "media.replace" || failure?.revision === attempt
+          ? undefined
+          : (() => {
+              const afterSnapshot = snapshot;
+              if (beforeSnapshot === undefined || afterSnapshot === undefined) return "Studio lost the media mutation snapshot.";
+              const beforeItems = beforeSnapshot.tracks.flatMap((track) => track.items);
+              const afterItems = afterSnapshot.tracks.flatMap((track) => track.items);
+              const target = afterItems.find((item) => item.id === mutation.itemId);
+              if (target?.mediaAsset?.assetId !== mutation.assetId) return `Item ${mutation.itemId} did not resolve to asset ${mutation.assetId}.`;
+              if (beforeItems.length !== afterItems.length
+                || JSON.stringify(beforeSnapshot.timeline) !== JSON.stringify(afterSnapshot.timeline)
+                || JSON.stringify(beforeSnapshot.run) !== JSON.stringify(afterSnapshot.run)) return "Media replacement changed the Run or timeline.";
+              for (const before of beforeItems) {
+                const after = afterItems.find((item) => item.id === before.id);
+                if (after === undefined || before.startFrame !== after.startFrame || before.endFrameExclusive !== after.endFrameExclusive
+                  || before.authoredId !== after.authoredId) return `Media replacement changed item ${before.id}.`;
+                if (before.id !== mutation.itemId && JSON.stringify(before.mediaAsset) !== JSON.stringify(after.mediaAsset)) {
+                  return `Media replacement changed non-target item ${before.id}.`;
+                }
               }
-            }
-            return undefined;
-          })();
-      if (failure?.revision !== attempt && temporalMismatch === undefined && mediaMismatch === undefined) {
+              return undefined;
+            })();
+        if (failure?.revision === attempt || temporalMismatch !== undefined || mediaMismatch !== undefined) {
+          throw new StudioMutationRejected(temporalMismatch ?? mediaMismatch ?? failure!.error);
+        }
         server?.ws.send({ type: "custom", event: "studio:snapshot", data: snapshot });
         return attempt;
-      }
-      const rejected = temporalMismatch ?? mediaMismatch ?? failure!.error;
-      await replaceSourceFiles(previous);
-      await publish(++requestedRevision, false);
-      server?.ws.send({ type: "custom", event: "studio:snapshot", data: snapshot });
-      throw new StudioMutationRejected(rejected);
+        },
+        restoreAndPublish: async (previous) => {
+          await replaceSourceFiles(previous);
+          await publish(++requestedRevision, false);
+          server?.ws.send({ type: "custom", event: "studio:snapshot", data: snapshot });
+        },
+      });
     } finally {
       mutating = false;
     }
@@ -619,8 +661,8 @@ export function studioPlugin(options: StudioPluginOptions): Plugin {
                 return;
               }
               if (body.type === "media.replace"
-                && (typeof body.itemId !== "string" || typeof body.assetId !== "string")) {
-                json(response, 400, { error: "Expected a visual item and registered asset identity." });
+                && !validMediaReplaceRequest(body)) {
+                json(response, 400, { error: "Expected a visual item, registered asset identity and manifest sha256." });
                 return;
               }
               const committed = await commitMutation(body as StudioMutation);
